@@ -1,0 +1,132 @@
+# GitHub Actions workflow: build Docker-enabled Buildroot Linux for v86
+# and publish it as a GitHub Release (permanent, CORS-friendly, 2GB-capable URLs)
+#
+# The v86 generator loads bzImage + rootfs.cpio as kernel + initrd from the
+# Release URLs. No embedding needed — v86 loads them side by side.
+
+name: build-docker-v86
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create the Release
+
+jobs:
+  buildroot:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /opt/hostedtoolcache/go
+          sudo rm -rf /usr/local/share/powershell
+          sudo rm -rf /usr/local/share/chromium
+          sudo rm -rf /usr/local/lib/node_modules
+          sudo rm -rf /opt/pipx
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+          df -h /
+
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl wget cpio unzip rsync bc gawk bison flex \
+            file python3 perl patch texinfo \
+            libncurses-dev libssl-dev libelf-dev \
+            gcc-multilib libc6-dev-i386 \
+            zlib1g-dev libidn2-dev libattr1-dev gperf gettext libtool \
+            autoconf automake autopoint pkg-config \
+            liblz4-tool zstd libzstd-dev libacl1-dev libtirpc-dev
+
+      - name: Get buildroot 2024.02.5
+        run: |
+          curl -fsSL -o /tmp/br.tar.gz \
+            https://buildroot.org/downloads/buildroot-2024.02.5.tar.gz
+          tar -xzf /tmp/br.tar.gz -C .
+          echo "BR_ROOT=$GITHUB_WORKSPACE/buildroot-2024.02.5" >> "$GITHUB_ENV"
+
+      - name: Drop in browser-buildroot standard config
+        run: |
+          cd "$BR_ROOT"
+          cp "$GITHUB_WORKSPACE/standard/.config" .config
+          mkdir -p board/browser_linux/rootfs_overlay
+          cp -r "$GITHUB_WORKSPACE/standard/board/browser_linux/"* board/browser_linux/
+          chmod +x board/browser_linux/rootfs_overlay/usr/bin/* 2>/dev/null || true
+
+      - name: Apply Docker config fragment
+        run: |
+          cd "$BR_ROOT"
+          cat >> .config <<'EOF'
+          BR2_PACKAGE_CA_CERTIFICATES=y
+          BR2_PACKAGE_LIBSECCOMP=y
+          BR2_PACKAGE_RUNC=y
+          BR2_PACKAGE_CONTAINERD=y
+          BR2_PACKAGE_DOCKER_CLI=y
+          BR2_PACKAGE_DOCKER_ENGINE=y
+          # We ship rootfs as a SEPARATE initrd (v86 loads kernel + initrd).
+          # Keep the cpio rootfs UNCOMPRESSED so v86 can load it as raw initrd.
+          BR2_TARGET_ROOTFS_CPIO=y
+          # Disable the embedded-initramfs path (we use external initrd)
+          # BR2_TARGET_ROOTFS_INITRAMFS is not set
+          EOF
+          make olddefconfig
+
+      - name: Merge Docker kernel options
+        run: |
+          cd "$BR_ROOT"
+          cat "$GITHUB_WORKSPACE/standard/board/browser_linux/docker-kernel.config" \
+              >> board/browser_linux/linux.conf
+
+      - name: Build (toolchain + rootfs + kernel)
+        run: |
+          cd "$BR_ROOT"
+          set -o pipefail
+          make -j4 2>&1 | tee /tmp/build.log
+
+      - name: Prepare release assets
+        run: |
+          set -e
+          cd "$BR_ROOT/output/images"
+          ls -la
+          test -f bzImage
+          # rootfs.cpio is LZ4-compressed per BR2_TARGET_ROOTFS_CPIO_LZ4=y.
+          # v86 loads initrd as RAW cpio (memcpy into RAM), so decompress to a
+          # true raw cpio for the initrd.
+          test -f rootfs.cpio.lz4
+          lz4 -d rootfs.cpio.lz4 rootfs.cpio.raw
+          mkdir -p "$GITHUB_WORKSPACE/release"
+          cp bzImage "$GITHUB_WORKSPACE/release/bzImage"
+          cp rootfs.cpio.raw "$GITHUB_WORKSPACE/release/rootfs.cpio"
+          # Keep the compressed one as a convenience
+          cp rootfs.cpio.lz4 "$GITHUB_WORKSPACE/release/rootfs.cpio.lz4" 2>/dev/null || true
+          ls -la "$GITHUB_WORKSPACE/release"
+          # Sanity check magic: 070701 = newc cpio, 184c2102 = LZ4 frame
+          echo "bzImage magic: $(head -c 8 release/bzImage | xxd -p)"
+          echo "rootfs.cpio magic: $(head -c 8 release/rootfs.cpio | xxd -p)"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: docker-v86-${{ github.run_number }}
+          name: Docker v86 build #${{ github.run_number }}
+          body: |
+            Docker-enabled Buildroot Linux for the v86 in-browser VM.
+
+            - `bzImage` — the kernel (LZ4-compressed, ~85MB)
+            - `rootfs.cpio` — the root filesystem with containerd/runc/docker (uncompressed initrd, ~224MB)
+            - `rootfs.cpio.lz4` — LZ4-compressed rootfs (alternative)
+
+            Load both into v86: `bzimage` + `initrd` options.
+          files: |
+            release/bzImage
+            release/rootfs.cpio
+            release/rootfs.cpio.lz4
+          fail_on_unmatched_files: false

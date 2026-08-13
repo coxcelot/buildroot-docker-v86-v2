@@ -1,0 +1,34 @@
+#!/bin/sh
+# S99docker — start containerd + dockerd at boot (BusyBox init, sysv style)
+# Runs after /etc/init.d/rcS via the S### ordering.
+case "$1" in
+  start)
+    # cgroup v2 mountpoint used by runc/containerd
+    [ -d /sys/fs/cgroup ] || mkdir -p /sys/fs/cgroup
+    if ! mountpoint -q /sys/fs/cgroup 2>/dev/null; then
+      mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || \
+        mount -t cgroup none /sys/fs/cgroup 2>/dev/null || true
+    fi
+    # containerd first (dockerd talks to it over its unix socket)
+    if command -v containerd >/dev/null 2>&1; then
+      echo "Starting containerd..." > /dev/console
+      /usr/bin/containerd &
+      # give it a moment to create its socket
+      sleep 2
+    fi
+    if command -v dockerd >/dev/null 2>&1; then
+      echo "Starting dockerd..." > /dev/console
+      # vfs storage driver is the only one that works on a tmpfs/ramfs rootfs
+      /usr/bin/dockerd --storage-driver=vfs &
+    fi
+    ;;
+  stop)
+    killall dockerd 2>/dev/null
+    killall containerd 2>/dev/null
+    ;;
+  *)
+    echo "Usage: $0 {start|stop}"
+    exit 1
+    ;;
+esac
+exit 0
